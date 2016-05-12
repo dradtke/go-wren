@@ -1,6 +1,8 @@
 go-wren
 =======
 
+[![GoDoc](https://godoc.org/github.com/dradtke/go-wren?status.png)](https://godoc.org/github.com/dradtke/go-wren)
+
 This package provides Go bindings to the [Wren](http://wren.io/index.html) scripting language.
 
 Getting Started
