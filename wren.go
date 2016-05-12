@@ -28,8 +28,6 @@
 //
 package wren
 
-// Tips: https://github.com/golang/go/wiki/cgo
-
 // #cgo CFLAGS: -I${SRCDIR}/wren/src/include
 // #cgo LDFLAGS: -L${SRCDIR}/wren/lib -lwren
 // #include <wren.h>
