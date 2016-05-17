@@ -19,3 +19,7 @@ func TestForeignClass(t *testing.T) {
 func TestForeignMethod(t *testing.T) {
 	testForeignMethod(t)
 }
+
+func TestGoToWren(t *testing.T) {
+	testGoToWren(t)
+}

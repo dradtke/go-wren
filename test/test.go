@@ -105,6 +105,37 @@ func testForeignMethod(t *testing.T) {
 	vm.Interpret(`GoMath.add("x", "y")`)
 }
 
+func testGoToWren(t *testing.T) {
+	vm := wren.NewVM()
+
+	if err := vm.Interpret(`
+		class WrenMath {
+			static do_add(a, b) {
+				return a + b
+			}
+		}
+	`); err != nil {
+		t.Log(err.Error())
+		t.FailNow()
+	}
+
+	x, err := vm.Variable("WrenMath").Call("do_add(_,_)", 2, 3)
+	if err != nil {
+		t.Log(err)
+		t.FailNow()
+	}
+
+	n, ok := x.(float64)
+	if !ok {
+		t.Logf("WrenMath.add(2, 3) returned unexpected value: %v", x)
+		t.FailNow()
+	}
+
+	if n != 5 {
+		t.Errorf("WrenMath.add(2, 3) returned unexpected value: %v", x)
+	}
+}
+
 type god struct {
 	msg string
 }

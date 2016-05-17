@@ -21,8 +21,7 @@
 //      }
 //
 // However, it's also possible to register foreign classes and methods in Go that can
-// be called from Wren. The reverse is not yet possible, but it likely will be at
-// some point.
+// be called from Wren, and to execute Wren code directly from Go.
 //
 // For more usage examples, check out the test package.
 //
@@ -121,19 +120,7 @@ func (vm *WrenVM) GC() {
 func (vm *WrenVM) Interpret(source string) error {
 	c_source := C.CString(source)
 	defer C.free(unsafe.Pointer(c_source))
-	switch C.wrenInterpret(vm.vm, c_source) {
-	case C.WREN_RESULT_SUCCESS:
-		return nil
-
-	case C.WREN_RESULT_COMPILE_ERROR:
-		return errors.New("compile error")
-
-	case C.WREN_RESULT_RUNTIME_ERROR:
-		return errors.New("runtime error")
-
-	default:
-		panic("unreachable")
-	}
+	return interpretResultToErr(C.wrenInterpret(vm.vm, c_source))
 }
 
 // InterpretFile interprets the Wren source code in the provided file.
@@ -156,20 +143,6 @@ func (vm *WrenVM) InterpretReader(r io.Reader) error {
 	return vm.Interpret(string(contents))
 }
 
-// NewForeign allocates a new foreign object.
-//
-// This method should only be called from a foreign class allocation function.
-// It takes an instance of the VM and a newly allocated foreign object ("foreign"
-// meaning that it's created in Go and not Wren) and makes it available to Wren.
-func NewForeign(vm unsafe.Pointer, x interface{}) {
-	var (
-		v   = reflect.Indirect(reflect.ValueOf(x))
-		t   = v.Type()
-		ptr = C.wrenSetSlotNewForeign(vm, C.int(0), C.int(0), C.size_t(t.Size()))
-	)
-	reflect.NewAt(t, ptr).Elem().Set(v)
-}
-
 // TODO: implement this better. It should automatically pick an available
 // slot, then convert the value to something useful.
 func (vm *WrenVM) getVariable(module, name string, slot int) {
@@ -182,6 +155,81 @@ func (vm *WrenVM) getVariable(module, name string, slot int) {
 		C.free(unsafe.Pointer(c_name))
 	}()
 	C.wrenGetVariable(vm.vm, c_module, c_name, C.int(slot))
+}
+
+// WrenValue represents a Wren value that Go has a handle to.
+type WrenValue struct {
+	vm      *C.WrenVM
+	value   *C.WrenValue
+	methods map[string]*C.WrenValue
+}
+
+// Variable looks up a variable by name and returns its value.
+func (vm *WrenVM) Variable(name string) *WrenValue {
+	var (
+		c_module = C.CString("main")
+		c_name   = C.CString(name)
+	)
+	defer func() {
+		C.free(unsafe.Pointer(c_module))
+		C.free(unsafe.Pointer(c_name))
+	}()
+
+	C.wrenEnsureSlots(vm.vm, 1)
+	C.wrenGetVariable(vm.vm, c_module, c_name, 0)
+	value := WrenValue{vm: vm.vm, value: C.wrenGetSlotValue(vm.vm, 0)}
+	if value.value == nil {
+		return nil
+	}
+	value.methods = make(map[string]*C.WrenValue)
+	runtime.SetFinalizer(&value, func(value *WrenValue) {
+		for _, method := range value.methods {
+			C.wrenReleaseValue(vm.vm, method)
+		}
+		C.wrenReleaseValue(vm.vm, value.value)
+	})
+	return &value
+}
+
+// Call calls the method with the given signature that belongs to the given value.
+//
+// The receiver should be the value on which the method is defined; a class reference
+// for static methods, and an instance of a class for instance methods. The signature
+// is a standard Wren method signature, and any parameters it expects will follow.
+func (v *WrenValue) Call(signature string, params ...interface{}) (interface{}, error) {
+	f := v.methods[signature]
+	if f == nil {
+		c_signature := C.CString(signature)
+		defer C.free(unsafe.Pointer(c_signature))
+		f = C.wrenMakeCallHandle(v.vm, c_signature)
+		v.methods[signature] = f
+	}
+	C.wrenEnsureSlots(v.vm, C.int(len(params)+1))
+	C.wrenSetSlotValue(v.vm, 0, v.value)
+	for i, param := range params {
+		saveToSlot(unsafe.Pointer(v.vm), i+1, reflect.ValueOf(param))
+	}
+	if err := interpretResultToErr(C.wrenCall(v.vm, f)); err != nil {
+		return nil, err
+	}
+	if retval := getFromSlot(unsafe.Pointer(v.vm), 0, nil); retval.IsValid() {
+		return retval.Interface(), nil
+	}
+	return nil, nil
+}
+
+// NewForeign allocates a new foreign object.
+//
+// This method should only be called from a foreign class allocation function.
+// It takes an instance of the VM and a newly allocated foreign object ("foreign"
+// meaning that it's created in Go and not Wren) and makes it available to Wren.
+func NewForeign(vm unsafe.Pointer, x interface{}) {
+	var (
+		v   = reflect.Indirect(reflect.ValueOf(x))
+		t   = v.Type()
+		ptr = C.wrenSetSlotNewForeign(vm, C.int(0), C.int(0), C.size_t(t.Size()))
+	)
+	reflect.NewAt(t, ptr).Elem().Set(v)
 }
 
 // HandleFunction is a helper method for foreign methods.
@@ -215,72 +263,24 @@ func HandleFunction(vm unsafe.Pointer, f interface{}) (err error) {
 
 	var offset int
 	for i := 0; i < ft.NumIn(); i++ {
-		slot := C.int(i + offset)
+		slot := i + offset
 
 		// If the receiver value is inaccessible from C, it likely just means that
 		// it's a native class with a foreign method. Rather than panic, we simply
 		// advance to the first parameter and continue from there.
-		if i == 0 && C.wrenGetSlotType(vm, slot) == C.WREN_TYPE_UNKNOWN {
+		if i == 0 && C.wrenGetSlotType(vm, C.int(slot)) == C.WREN_TYPE_UNKNOWN {
 			offset++
 			slot++
 		}
 
-		switch C.wrenGetSlotType(vm, slot) {
-		case C.WREN_TYPE_BOOL:
-			params[i] = reflect.ValueOf(bool(C.wrenGetSlotBool(vm, slot)))
-
-		case C.WREN_TYPE_NUM:
-			n := float64(C.wrenGetSlotDouble(vm, slot))
-			params[i] = reflect.ValueOf(n).Convert(ft.In(i))
-
-		case C.WREN_TYPE_FOREIGN:
-			ptr := C.wrenGetSlotForeign(vm, slot)
-			params[i] = reflect.NewAt(ft.In(i).Elem(), ptr)
-
-		case C.WREN_TYPE_LIST:
-			panic("not sure how to get a list value from the slot")
-
-		case C.WREN_TYPE_NULL:
-			params[i] = reflect.ValueOf(nil)
-
-		case C.WREN_TYPE_STRING:
-			str := C.GoString(C.wrenGetSlotString(vm, slot))
-			params[i] = reflect.ValueOf(str)
-
-		case C.WREN_TYPE_UNKNOWN:
-			panic(fmt.Sprintf("received an inaccessible-from-C parameter in slot %d", slot))
-		}
+		it := ft.In(i)
+		params[i] = getFromSlot(vm, slot, &it)
 	}
 
 	returnValues := fv.Call(params)
-	// TODO: allow returning a second value if it's an `error`
+	// TODO: allow returning a second value if it's an `error`, like the template packages
 	if len(returnValues) == 1 {
-		slot := C.int(0)
-		switch returnValues[0].Kind() {
-		case reflect.Bool:
-			c_value := C.bool(returnValues[0].Interface().(bool))
-			C.wrenSetSlotBool(vm, slot, c_value)
-
-		case reflect.Float32, reflect.Float64:
-			c_value := C.double(returnValues[0].Float())
-			C.wrenSetSlotDouble(vm, slot, c_value)
-
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			c_value := C.double(returnValues[0].Int())
-			C.wrenSetSlotDouble(vm, slot, c_value)
-
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			c_value := C.double(returnValues[0].Uint())
-			C.wrenSetSlotDouble(vm, slot, c_value)
-
-		case reflect.String:
-			c_value := C.CString(returnValues[0].Interface().(string))
-			defer C.free(unsafe.Pointer(c_value))
-			C.wrenSetSlotString(vm, slot, c_value)
-
-		default:
-			panic(fmt.Sprintf("don't know how to return value of type: %s", returnValues[0].Type().Name()))
-		}
+		saveToSlot(vm, 0, returnValues[0])
 	}
 	return
 }
@@ -360,5 +360,88 @@ func writeErr(errorType C.WrenErrorType, module *C.char, line C.int, message *C.
 
 	default:
 		panic("impossible error type")
+	}
+}
+
+func interpretResultToErr(result C.WrenInterpretResult) error {
+	switch result {
+	case C.WREN_RESULT_SUCCESS:
+		return nil
+
+	case C.WREN_RESULT_COMPILE_ERROR:
+		return errors.New("compilation error")
+
+	case C.WREN_RESULT_RUNTIME_ERROR:
+		return errors.New("runtime error")
+
+	default:
+		panic("unreachable")
+	}
+}
+
+func saveToSlot(vm unsafe.Pointer, slot int, v reflect.Value) {
+	c_slot := C.int(slot)
+	switch v.Kind() {
+	case reflect.Bool:
+		c_value := C.bool(v.Interface().(bool))
+		C.wrenSetSlotBool(vm, c_slot, c_value)
+
+	case reflect.Float32, reflect.Float64:
+		c_value := C.double(v.Float())
+		C.wrenSetSlotDouble(vm, c_slot, c_value)
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		c_value := C.double(v.Int())
+		C.wrenSetSlotDouble(vm, c_slot, c_value)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		c_value := C.double(v.Uint())
+		C.wrenSetSlotDouble(vm, c_slot, c_value)
+
+	case reflect.String:
+		c_value := C.CString(v.Interface().(string))
+		defer C.free(unsafe.Pointer(c_value))
+		C.wrenSetSlotString(vm, c_slot, c_value)
+
+	default:
+		panic(fmt.Sprintf("don't know how to save this to a slot: %s", v.Type().Name()))
+	}
+}
+
+func getFromSlot(vm unsafe.Pointer, slot int, in *reflect.Type) reflect.Value {
+	c_slot := C.int(slot)
+	switch C.wrenGetSlotType(vm, c_slot) {
+	case C.WREN_TYPE_BOOL:
+		return reflect.ValueOf(bool(C.wrenGetSlotBool(vm, c_slot)))
+
+	case C.WREN_TYPE_NUM:
+		n := reflect.ValueOf(float64(C.wrenGetSlotDouble(vm, c_slot)))
+		if in != nil {
+			return n.Convert(*in)
+		}
+		return n
+
+	case C.WREN_TYPE_FOREIGN:
+		if in == nil {
+			panic("can't return foreign value without type information!")
+		}
+		ptr := C.wrenGetSlotForeign(vm, c_slot)
+		return reflect.NewAt((*in).Elem(), ptr)
+
+	case C.WREN_TYPE_LIST:
+		panic("not sure how to get a list value from the slot")
+
+	case C.WREN_TYPE_NULL:
+		return reflect.Value{}
+
+	case C.WREN_TYPE_STRING:
+		str := C.GoString(C.wrenGetSlotString(vm, c_slot))
+		return reflect.ValueOf(str)
+
+	case C.WREN_TYPE_UNKNOWN:
+		panic(fmt.Sprintf("received an inaccessible-from-C parameter in slot %d", slot))
+
+	default:
+		panic("unreachable")
 	}
 }
