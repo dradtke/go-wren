@@ -25,6 +25,7 @@ static inline void* get_f(int i) {
 import "C"
 import (
 	"errors"
+	"sync"
 	"unsafe"
 )
 
@@ -32,6 +33,7 @@ const MAX_REGISTRATIONS = {{len .}}
 
 var (
 	fMap = make(map[int]func())
+	fMapGuard sync.Mutex
 	counter int
 )
 
@@ -51,7 +53,9 @@ func registerFunc(name string, f func()) (unsafe.Pointer, error) {
 		return nil, errors.New("maximum function registration reached")
 	}
 
-	// TODO: make this thread-safe
+	fMapGuard.Lock()
+	defer fMapGuard.Unlock()
+
 	fMap[counter] = f
 	ptr := C.get_f(C.int(counter))
 	counter++
