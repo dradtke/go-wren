@@ -14,5 +14,5 @@ Run these commands to download the package, build the library, and run tests:
 $ go get -d github.com/dradtke/go-wren
 $ cd ${GOPATH}/src/github.com/dradtke/go-wren
 $ (cd wren && make static)
-$ go test ./test
+$ go test
 ```

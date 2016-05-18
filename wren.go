@@ -23,7 +23,13 @@
 // However, it's also possible to register foreign classes and methods in Go that can
 // be called from Wren, and to execute Wren code directly from Go.
 //
-// For more usage examples, check out the test package.
+// Foreign Function Limits
+//
+// Due to Go's inability to generate C-exported functions at runtime, the number of
+// foreign methods able to be registered with the Wren VM through this package is limited
+// to 128. This number is completely arbitrary, though, and can be changed by modifying
+// the directive at the bottom of wren.go and running "go generate". If you feel like
+// this number is a terrible default, pull requests will be happily accepted.
 //
 package wren
 
@@ -49,19 +55,19 @@ import (
 )
 
 var (
-	vmMap     = make(map[*C.WrenVM]*WrenVM)
+	vmMap     = make(map[*C.WrenVM]*VM)
 	errWriter io.Writer
 )
 
-// WrenVM is a single instance of a Wren virtual machine.
-type WrenVM struct {
+// VM is a single instance of a Wren virtual machine.
+type VM struct {
 	vm               *C.WrenVM
 	classes, methods map[string]unsafe.Pointer
 	outWriter        io.Writer
 }
 
 // NewVM creates a new Wren virtual machine.
-func NewVM() *WrenVM {
+func NewVM() *VM {
 	var config C.WrenConfiguration
 	C.wrenInitConfiguration(&config)
 
@@ -70,11 +76,11 @@ func NewVM() *WrenVM {
 	config.bindForeignClassFn = C.WrenBindForeignClassFn(C.bindClass)
 	config.errorFn = C.WrenErrorFn(C.writeErr)
 
-	vm := WrenVM{vm: C.wrenNewVM(&config)}
+	vm := VM{vm: C.wrenNewVM(&config)}
 	vm.classes = make(map[string]unsafe.Pointer)
 	vm.methods = make(map[string]unsafe.Pointer)
 	vmMap[vm.vm] = &vm
-	runtime.SetFinalizer(&vm, func(vm *WrenVM) {
+	runtime.SetFinalizer(&vm, func(vm *VM) {
 		C.wrenFreeVM(vm.vm)
 		delete(vmMap, vm.vm)
 	})
@@ -90,18 +96,34 @@ func NewVM() *WrenVM {
 //
 // At minimum, it should have the class name and the method name separated by a period,
 // optionally with the word "static" out front to denote that it's a static method.
-func (vm *WrenVM) RegisterForeignMethod(fullName string, x interface{}) {
-	vmMap[vm.vm].methods[fullName] = unsafe.Pointer(reflect.ValueOf(x).Pointer())
+func (vm *VM) RegisterForeignMethod(fullName string, f interface{}) error {
+	ptr, err := registerFunc(fullName, func() {
+		if err := handleFunction(vm.vm, f); err != nil {
+			panic(err)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	vmMap[vm.vm].methods[fullName] = ptr
+	return nil
 }
 
 // RegisterForeignClass registers a foreign class with the virtual machine.
-func (vm *WrenVM) RegisterForeignClass(className string, x interface{}) {
-	vmMap[vm.vm].classes[className] = unsafe.Pointer(reflect.ValueOf(x).Pointer())
+func (vm *VM) RegisterForeignClass(className string, f func() interface{}) error {
+	ptr, err := registerFunc(className, func() {
+		newForeign(vm.vm, f())
+	})
+	if err != nil {
+		return err
+	}
+	vmMap[vm.vm].classes[className] = ptr
+	return nil
 }
 
 // SetOutputWriter sets the writer to be used for script output. If this method is never
 // called (or called with nil), it uses standard output.
-func (vm *WrenVM) SetOutputWriter(w io.Writer) {
+func (vm *VM) SetOutputWriter(w io.Writer) {
 	vmMap[vm.vm].outWriter = w
 }
 
@@ -112,19 +134,19 @@ func SetErrorWriter(w io.Writer) {
 }
 
 // GC initiates a garbage collection.
-func (vm *WrenVM) GC() {
+func (vm *VM) GC() {
 	C.wrenCollectGarbage(vm.vm)
 }
 
 // Interpret interprets the provided Wren source code.
-func (vm *WrenVM) Interpret(source string) error {
+func (vm *VM) Interpret(source string) error {
 	c_source := C.CString(source)
 	defer C.free(unsafe.Pointer(c_source))
 	return interpretResultToErr(C.wrenInterpret(vm.vm, c_source))
 }
 
 // InterpretFile interprets the Wren source code in the provided file.
-func (vm *WrenVM) InterpretFile(filename string) error {
+func (vm *VM) InterpretFile(filename string) error {
 	contents, err := ioutil.ReadFile(filename)
 	if err != nil {
 		return err
@@ -135,7 +157,7 @@ func (vm *WrenVM) InterpretFile(filename string) error {
 // InterpretReader interprets the Wren source code from the provided reader.
 // Note that the reader must be read fully before interpretation will begin;
 // it's not possible to interpret an infinite stream of input.
-func (vm *WrenVM) InterpretReader(r io.Reader) error {
+func (vm *VM) InterpretReader(r io.Reader) error {
 	contents, err := ioutil.ReadAll(r)
 	if err != nil {
 		return err
@@ -145,7 +167,7 @@ func (vm *WrenVM) InterpretReader(r io.Reader) error {
 
 // TODO: implement this better. It should automatically pick an available
 // slot, then convert the value to something useful.
-func (vm *WrenVM) getVariable(module, name string, slot int) {
+func (vm *VM) getVariable(module, name string, slot int) {
 	var (
 		c_module = C.CString(module)
 		c_name   = C.CString(name)
@@ -157,15 +179,15 @@ func (vm *WrenVM) getVariable(module, name string, slot int) {
 	C.wrenGetVariable(vm.vm, c_module, c_name, C.int(slot))
 }
 
-// WrenValue represents a Wren value that Go has a handle to.
-type WrenValue struct {
+// Value represents a Wren value that Go has a handle to.
+type Value struct {
 	vm      *C.WrenVM
 	value   *C.WrenValue
 	methods map[string]*C.WrenValue
 }
 
 // Variable looks up a variable by name and returns its value.
-func (vm *WrenVM) Variable(name string) *WrenValue {
+func (vm *VM) Variable(name string) *Value {
 	var (
 		c_module = C.CString("main")
 		c_name   = C.CString(name)
@@ -177,12 +199,12 @@ func (vm *WrenVM) Variable(name string) *WrenValue {
 
 	C.wrenEnsureSlots(vm.vm, 1)
 	C.wrenGetVariable(vm.vm, c_module, c_name, 0)
-	value := WrenValue{vm: vm.vm, value: C.wrenGetSlotValue(vm.vm, 0)}
+	value := Value{vm: vm.vm, value: C.wrenGetSlotValue(vm.vm, 0)}
 	if value.value == nil {
 		return nil
 	}
 	value.methods = make(map[string]*C.WrenValue)
-	runtime.SetFinalizer(&value, func(value *WrenValue) {
+	runtime.SetFinalizer(&value, func(value *Value) {
 		for _, method := range value.methods {
 			C.wrenReleaseValue(vm.vm, method)
 		}
@@ -196,7 +218,7 @@ func (vm *WrenVM) Variable(name string) *WrenValue {
 // The receiver should be the value on which the method is defined; a class reference
 // for static methods, and an instance of a class for instance methods. The signature
 // is a standard Wren method signature, and any parameters it expects will follow.
-func (v *WrenValue) Call(signature string, params ...interface{}) (interface{}, error) {
+func (v *Value) Call(signature string, params ...interface{}) (interface{}, error) {
 	f := v.methods[signature]
 	if f == nil {
 		c_signature := C.CString(signature)
@@ -207,23 +229,23 @@ func (v *WrenValue) Call(signature string, params ...interface{}) (interface{}, 
 	C.wrenEnsureSlots(v.vm, C.int(len(params)+1))
 	C.wrenSetSlotValue(v.vm, 0, v.value)
 	for i, param := range params {
-		saveToSlot(unsafe.Pointer(v.vm), i+1, reflect.ValueOf(param))
+		saveToSlot(v.vm, i+1, reflect.ValueOf(param))
 	}
 	if err := interpretResultToErr(C.wrenCall(v.vm, f)); err != nil {
 		return nil, err
 	}
-	if retval := getFromSlot(unsafe.Pointer(v.vm), 0, nil); retval.IsValid() {
+	if retval := getFromSlot(v.vm, 0, nil); retval.IsValid() {
 		return retval.Interface(), nil
 	}
 	return nil, nil
 }
 
-// NewForeign allocates a new foreign object.
+// newForeign allocates a new foreign object.
 //
 // This method should only be called from a foreign class allocation function.
 // It takes an instance of the VM and a newly allocated foreign object ("foreign"
 // meaning that it's created in Go and not Wren) and makes it available to Wren.
-func NewForeign(vm unsafe.Pointer, x interface{}) {
+func newForeign(vm *C.WrenVM, x interface{}) {
 	var (
 		v   = reflect.Indirect(reflect.ValueOf(x))
 		t   = v.Type()
@@ -232,7 +254,7 @@ func NewForeign(vm unsafe.Pointer, x interface{}) {
 	reflect.NewAt(t, ptr).Elem().Set(v)
 }
 
-// HandleFunction is a helper method for foreign methods.
+// handleFunction is a helper method for foreign methods.
 //
 // This method takes two parameters: a reference to the virtual machine instance
 // (which should be the only parameter provided in the C-exported callback)
@@ -240,7 +262,7 @@ func NewForeign(vm unsafe.Pointer, x interface{}) {
 // If it doesn't, this call will return an error, but the call to Interpret() will not.
 //
 // For examples, check out the test package.
-func HandleFunction(vm unsafe.Pointer, f interface{}) (err error) {
+func handleFunction(vm *C.WrenVM, f interface{}) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Fuck.
@@ -379,7 +401,7 @@ func interpretResultToErr(result C.WrenInterpretResult) error {
 	}
 }
 
-func saveToSlot(vm unsafe.Pointer, slot int, v reflect.Value) {
+func saveToSlot(vm *C.WrenVM, slot int, v reflect.Value) {
 	c_slot := C.int(slot)
 	switch v.Kind() {
 	case reflect.Bool:
@@ -408,7 +430,7 @@ func saveToSlot(vm unsafe.Pointer, slot int, v reflect.Value) {
 	}
 }
 
-func getFromSlot(vm unsafe.Pointer, slot int, in *reflect.Type) reflect.Value {
+func getFromSlot(vm *C.WrenVM, slot int, in *reflect.Type) reflect.Value {
 	c_slot := C.int(slot)
 	switch C.wrenGetSlotType(vm, c_slot) {
 	case C.WREN_TYPE_BOOL:
@@ -445,3 +467,6 @@ func getFromSlot(vm unsafe.Pointer, slot int, in *reflect.Type) reflect.Value {
 		panic("unreachable")
 	}
 }
+
+// Change 128 to a different number to enable more foreign class/method registrations.
+//go:generate go run cgluer.go 128
