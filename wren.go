@@ -34,13 +34,13 @@
 package wren
 
 // #cgo CFLAGS: -I${SRCDIR}/wren/src/include
-// #cgo LDFLAGS: -L${SRCDIR}/wren/lib -lwren
+// #cgo LDFLAGS: -L${SRCDIR}/wren/lib -lwren -lm
 // #include <wren.h>
 //
 // extern void write(WrenVM*, char*);
 // extern void* bindMethod(WrenVM*, char*, char*, bool, char*);
 // extern WrenForeignClassMethods bindClass(WrenVM*, char*, char*);
-// extern void writeErr(WrenErrorType, char* module, int line, char* message);
+// extern void writeErr(WrenVM*, WrenErrorType, char* module, int line, char* message);
 import "C"
 import (
 	"bytes"
@@ -182,8 +182,8 @@ func (vm *VM) getVariable(module, name string, slot int) {
 // Value represents a Wren value that Go has a handle to.
 type Value struct {
 	vm      *C.WrenVM
-	value   *C.WrenValue
-	methods map[string]*C.WrenValue
+	value   *C.WrenHandle
+	methods map[string]*C.WrenHandle
 }
 
 // Variable looks up a variable by name and returns its value.
@@ -199,16 +199,16 @@ func (vm *VM) Variable(name string) *Value {
 
 	C.wrenEnsureSlots(vm.vm, 1)
 	C.wrenGetVariable(vm.vm, c_module, c_name, 0)
-	value := Value{vm: vm.vm, value: C.wrenGetSlotValue(vm.vm, 0)}
+	value := Value{vm: vm.vm, value: C.wrenGetSlotHandle(vm.vm, 0)}
 	if value.value == nil {
 		return nil
 	}
-	value.methods = make(map[string]*C.WrenValue)
+	value.methods = make(map[string]*C.WrenHandle)
 	runtime.SetFinalizer(&value, func(value *Value) {
 		for _, method := range value.methods {
-			C.wrenReleaseValue(vm.vm, method)
+			C.wrenReleaseHandle(vm.vm, method)
 		}
-		C.wrenReleaseValue(vm.vm, value.value)
+		C.wrenReleaseHandle(vm.vm, value.value)
 	})
 	return &value
 }
@@ -227,7 +227,7 @@ func (v *Value) Call(signature string, params ...interface{}) (interface{}, erro
 		v.methods[signature] = f
 	}
 	C.wrenEnsureSlots(v.vm, C.int(len(params)+1))
-	C.wrenSetSlotValue(v.vm, 0, v.value)
+	C.wrenSetSlotHandle(v.vm, 0, v.value)
 	for i, param := range params {
 		saveToSlot(v.vm, i+1, reflect.ValueOf(param))
 	}
@@ -364,7 +364,7 @@ func bindClass(vm *C.WrenVM, c_module, c_className *C.char) C.WrenForeignClassMe
 }
 
 //export writeErr
-func writeErr(errorType C.WrenErrorType, module *C.char, line C.int, message *C.char) {
+func writeErr(vm *C.WrenVM, errorType C.WrenErrorType, module *C.char, line C.int, message *C.char) {
 	out := errWriter
 	if out == nil {
 		out = os.Stderr
