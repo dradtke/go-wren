@@ -140,9 +140,11 @@ func (vm *VM) GC() {
 
 // Interpret interprets the provided Wren source code.
 func (vm *VM) Interpret(source string) error {
+	c_module := C.CString("main")
+	defer C.free(unsafe.Pointer(c_module))
 	c_source := C.CString(source)
 	defer C.free(unsafe.Pointer(c_source))
-	return interpretResultToErr(C.wrenInterpret(vm.vm, c_source))
+	return interpretResultToErr(C.wrenInterpret(vm.vm, c_module, c_source))
 }
 
 // InterpretFile interprets the Wren source code in the provided file.
