@@ -359,7 +359,10 @@ func loadModule(vm *C.WrenVM, name *C.char) *C.char {
 			jval := C.GoString((*C.char)(jvalPtr))
 			if e := json.Unmarshal([]byte(jval), &userData); e == nil {
 				if modulesDir, ok := userData["MODULES_DIR"]; ok {
-					if fdata, e := ioutil.ReadFile(filepath.Join(modulesDir.(string), C.GoString(name)) + ".wren"); e == nil {
+					// Precedence (modules_dir/module_name.wren) next (modules_dir/module_name/module.wren)
+					if fdata, e := ioutil.ReadFile(filepath.Join(modulesDir.(string), module) + ".wren"); e == nil {
+						source = string(fdata)
+					} else if fdata, e = ioutil.ReadFile(filepath.Join(modulesDir.(string), module, "module.wren")); e == nil {
 						source = string(fdata)
 					}
 				}
