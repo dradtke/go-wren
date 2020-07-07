@@ -344,6 +344,25 @@ func write(vm *C.WrenVM, text *C.char) {
 	fmt.Fprint(out, C.GoString(text))
 }
 
+//helper
+func readModule(dir string, name string) (string, error) {
+	var err error
+
+	// Precedence (dir/name.wren) next (dir/name/module.wren)
+	filename := filepath.Join(dir, name+".wren")
+	if _, err = os.Stat(filename); os.IsNotExist(err) {
+		filename = filepath.Join(dir, name, "module.wren")
+		if _, err = os.Stat(filename); os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	var data []byte
+	if data, err = ioutil.ReadFile(filename); err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 //export loadModule
 func loadModule(vm *C.WrenVM, name *C.char) *C.char {
 	var module string = C.GoString(name)
@@ -359,10 +378,7 @@ func loadModule(vm *C.WrenVM, name *C.char) *C.char {
 			jval := C.GoString((*C.char)(jvalPtr))
 			if e := json.Unmarshal([]byte(jval), &userData); e == nil {
 				if modulesDir, ok := userData["MODULES_DIR"]; ok {
-					// Precedence (modules_dir/module_name.wren) next (modules_dir/module_name/module.wren)
-					if fdata, e := ioutil.ReadFile(filepath.Join(modulesDir.(string), module) + ".wren"); e == nil {
-						source = string(fdata)
-					} else if fdata, e = ioutil.ReadFile(filepath.Join(modulesDir.(string), module, "module.wren")); e == nil {
+					if fdata, e := readModule(modulesDir.(string), module); e == nil {
 						source = string(fdata)
 					}
 				}
