@@ -363,22 +363,26 @@ func readModule(dir string, name string) (string, error) {
 //export loadModule
 func loadModule(vm *C.WrenVM, name *C.char) *C.char {
 	var module string = C.GoString(name)
-	var source string
 
 	// Ensure module does not have undesired characters
 	// that can pose thread to remote-code-inclusions
-	if !strings.Contains(module, "..") {
-		// Proceed to load from the configured modules directory only
-		var jvalPtr unsafe.Pointer = C.wrenGetUserData(vm)
-		if jvalPtr != nil {
-			userData := make(map[string]interface{})
-			jval := C.GoString((*C.char)(jvalPtr))
-			if e := json.Unmarshal([]byte(jval), &userData); e == nil {
-				if modulesDir, ok := userData["MODULES_DIR"]; ok {
-					if fdata, e := readModule(modulesDir.(string), module); e == nil {
-						source = string(fdata)
-					}
-				}
+	if strings.Contains(module, "..") {
+		// early return with no-code
+		return C.CString("")
+	}
+
+	var source string
+
+	// Proceed to load from the configured modules directory only
+	var jvalPtr unsafe.Pointer = C.wrenGetUserData(vm)
+	if jvalPtr != nil {
+		userData := make(map[string]interface{})
+		jval := C.GoString((*C.char)(jvalPtr))
+		if e := json.Unmarshal([]byte(jval), &userData); e == nil {
+			if modulesDir, ok := userData["MODULES_DIR"]; ok {
+				if fdata, e := readModule(modulesDir.(string), module); e == nil {
+					source = string(fdata)
+				} // TOOD: log error or return to Wren VM
 			}
 		}
 	}
