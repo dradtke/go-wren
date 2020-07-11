@@ -346,21 +346,18 @@ func write(vm *C.WrenVM, text *C.char) {
 
 //helper
 func readModule(dir string, name string) (string, error) {
-	var err error
-
 	// Precedence (dir/name.wren) next (dir/name/module.wren)
-	filename := filepath.Join(dir, name+".wren")
-	if _, err = os.Stat(filename); os.IsNotExist(err) {
-		filename = filepath.Join(dir, name, "module.wren")
-		if _, err = os.Stat(filename); os.IsNotExist(err) {
-			return "", err
+	for _, filename := range []string{
+		filepath.Join(dir, name+".wren"),
+		filepath.Join(dir, name, "module.wren"),
+	} {
+		if data, err := ioutil.ReadFile(filename); err == nil {
+			return string(data), nil
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("load module: error reading file %s: %w", filename, err)
 		}
 	}
-	var data []byte
-	if data, err = ioutil.ReadFile(filename); err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return "", fmt.Errorf("module not found: %s", name)
 }
 
 //export loadModule
