@@ -41,16 +41,20 @@ package wren
 // extern void* bindMethod(WrenVM*, char*, char*, bool, char*);
 // extern WrenForeignClassMethods bindClass(WrenVM*, char*, char*);
 // extern void writeErr(WrenVM*, WrenErrorType, char* module, int line, char* message);
+// extern char* loadModule(WrenVM*, char*);
 import "C"
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -63,6 +67,8 @@ var (
 type VM struct {
 	vm               *C.WrenVM
 	classes, methods map[string]unsafe.Pointer
+	userData         map[string]interface{}
+	userDataPtr      unsafe.Pointer
 	outWriter        io.Writer
 }
 
@@ -75,16 +81,36 @@ func NewVM() *VM {
 	config.bindForeignMethodFn = C.WrenBindForeignMethodFn(C.bindMethod)
 	config.bindForeignClassFn = C.WrenBindForeignClassFn(C.bindClass)
 	config.errorFn = C.WrenErrorFn(C.writeErr)
+	config.loadModuleFn = C.WrenLoadModuleFn(C.loadModule)
 
 	vm := VM{vm: C.wrenNewVM(&config)}
 	vm.classes = make(map[string]unsafe.Pointer)
 	vm.methods = make(map[string]unsafe.Pointer)
+	vm.userData = make(map[string]interface{})
 	vmMap[vm.vm] = &vm
 	runtime.SetFinalizer(&vm, func(vm *VM) {
 		C.wrenFreeVM(vm.vm)
 		delete(vmMap, vm.vm)
 	})
+
 	return &vm
+}
+
+// SetModulesDir sets lookup directory for modules to import from.
+func (vm *VM) SetModulesDir(path string) {
+	vm.setUserData("MODULES_DIR", path)
+}
+
+// setUserData preserves (key, val) userdata and makes it available to virtual machine.
+func (vm *VM) setUserData(key string, val interface{}) {
+	vm.userData[key] = val
+	if jval, e := json.Marshal(vm.userData); e == nil {
+		if vm.userDataPtr != nil {
+			C.free(vm.userDataPtr)
+		}
+		vm.userDataPtr = unsafe.Pointer(C.CString(string(jval)))
+		C.wrenSetUserData(vm.vm, vm.userDataPtr)
+	}
 }
 
 // RegisterForeignMethod registers a foreign method with the virtual machine.
@@ -316,6 +342,52 @@ func write(vm *C.WrenVM, text *C.char) {
 		out = os.Stdout
 	}
 	fmt.Fprint(out, C.GoString(text))
+}
+
+//helper
+func readModule(dir string, name string) (string, error) {
+	// Precedence (dir/name.wren) next (dir/name/module.wren)
+	for _, filename := range []string{
+		filepath.Join(dir, name+".wren"),
+		filepath.Join(dir, name, "module.wren"),
+	} {
+		if data, err := ioutil.ReadFile(filename); err == nil {
+			return string(data), nil
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("load module: error reading file %s: %w", filename, err)
+		}
+	}
+	return "", fmt.Errorf("module not found: %s", name)
+}
+
+//export loadModule
+func loadModule(vm *C.WrenVM, name *C.char) *C.char {
+	var module string = C.GoString(name)
+
+	// Ensure module does not have undesired characters
+	// that can pose thread to remote-code-inclusions
+	if strings.Contains(module, "..") {
+		// early return with no-code
+		return C.CString("")
+	}
+
+	var source string
+
+	// Proceed to load from the configured modules directory only
+	var jvalPtr unsafe.Pointer = C.wrenGetUserData(vm)
+	if jvalPtr != nil {
+		userData := make(map[string]interface{})
+		jval := C.GoString((*C.char)(jvalPtr))
+		if e := json.Unmarshal([]byte(jval), &userData); e == nil {
+			if modulesDir, ok := userData["MODULES_DIR"]; ok {
+				if fdata, e := readModule(modulesDir.(string), module); e == nil {
+					source = string(fdata)
+				} // TOOD: log error or return to Wren VM
+			}
+		}
+	}
+
+	return C.CString(source)
 }
 
 //export bindMethod
